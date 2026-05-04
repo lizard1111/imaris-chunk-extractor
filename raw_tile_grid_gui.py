@@ -17,7 +17,9 @@ from PyQt5.QtWidgets import (
     QComboBox,
     QCheckBox,
     QFileDialog,
+    QGraphicsItem,
     QGraphicsPixmapItem,
+    QGraphicsRectItem,
     QGraphicsScene,
     QGraphicsView,
     QGridLayout,
@@ -42,6 +44,20 @@ from imaris_chunk_tool.raw_tiles import (
     discover_channel_dirs,
     discover_channel_grid,
 )
+
+
+class TilePixmapItem(QGraphicsPixmapItem):
+    def __init__(self, window: "RawTileGridWindow", plane: RawTilePlane, array: np.ndarray) -> None:
+        super().__init__()
+        self.window = window
+        self.plane = plane
+        self.array = array
+        self.setFlag(QGraphicsItem.ItemIsSelectable, True)
+        self.setAcceptedMouseButtons(Qt.LeftButton)
+
+    def mousePressEvent(self, event: Any) -> None:
+        self.window.select_tile(self)
+        super().mousePressEvent(event)
 
 
 class ZoomableGraphicsView(QGraphicsView):
@@ -145,7 +161,10 @@ class RawTileGridWindow(QMainWindow):
         self.channel_dirs: list[Path] = []
         self.current_grid: RawChannelGrid | None = None
         self.mosaic_items: list[tuple[RawTilePlane, np.ndarray, int, int]] = []
-        self.tile_graphics: list[tuple[QGraphicsPixmapItem, np.ndarray]] = []
+        self.tile_graphics: list[tuple[TilePixmapItem, np.ndarray]] = []
+        self.grid_rects: list[QGraphicsRectItem] = []
+        self.selected_tile: TilePixmapItem | None = None
+        self.selection_rect: QGraphicsRectItem | None = None
 
         self.root_path = QLineEdit()
         self.channel_combo = QComboBox()
@@ -158,6 +177,9 @@ class RawTileGridWindow(QMainWindow):
         self.overlap_percent.setValue(int(DEFAULT_TILE_OVERLAP_FRACTION * 100))
         self.flip_vertical = QCheckBox()
         self.flip_vertical.setChecked(True)
+        self.show_grid = QCheckBox()
+        self.show_grid.setChecked(True)
+        self.show_grid.stateChanged.connect(self.update_grid_visibility)
         self.display_min = QSpinBox()
         self.display_min.setRange(0, 65535)
         self.display_min.setValue(0)
@@ -172,6 +194,9 @@ class RawTileGridWindow(QMainWindow):
         self.progress_bar.setValue(0)
         self.log = QTextEdit()
         self.log.setReadOnly(True)
+        self.selected_tile_info = QTextEdit()
+        self.selected_tile_info.setReadOnly(True)
+        self.selected_tile_info.setMaximumHeight(96)
 
         self.scene = QGraphicsScene()
         self.view = ZoomableGraphicsView(self.scene)
@@ -210,6 +235,8 @@ class RawTileGridWindow(QMainWindow):
         controls_layout.addWidget(self.overlap_percent, 3, 1)
         controls_layout.addWidget(QLabel("Flip vertical"), 4, 0)
         controls_layout.addWidget(self.flip_vertical, 4, 1)
+        controls_layout.addWidget(QLabel("Grid lines"), 4, 2)
+        controls_layout.addWidget(self.show_grid, 4, 3)
         controls_layout.addWidget(QLabel("Display min"), 5, 0)
         controls_layout.addWidget(self.display_min, 5, 1)
         controls_layout.addWidget(QLabel("Display max"), 6, 0)
@@ -223,6 +250,8 @@ class RawTileGridWindow(QMainWindow):
 
         layout.addWidget(controls)
         layout.addWidget(self.view, stretch=1)
+        layout.addWidget(QLabel("Selected Tile"))
+        layout.addWidget(self.selected_tile_info)
         layout.addLayout(progress_layout)
         layout.addWidget(QLabel("Log"))
         layout.addWidget(self.log)
@@ -286,11 +315,16 @@ class RawTileGridWindow(QMainWindow):
         self.current_grid = grid
         self.mosaic_items = items
         self.tile_graphics = []
+        self.grid_rects = []
+        self.selected_tile = None
+        self.selection_rect = None
+        self.selected_tile_info.clear()
         self.scene.clear()
         pen = QPen(QColor(0, 180, 255), 1)
         for plane, array, x, y in items:
             image = self.array_to_qimage(array)
-            pixmap_item = QGraphicsPixmapItem(QPixmap.fromImage(image))
+            pixmap_item = TilePixmapItem(self, plane, array)
+            pixmap_item.setPixmap(QPixmap.fromImage(image))
             pixmap_item.setPos(x, y)
             pixmap_item.setToolTip(
                 f"{plane.channel}\n"
@@ -299,7 +333,9 @@ class RawTileGridWindow(QMainWindow):
                 f"{plane.path}"
             )
             self.scene.addItem(pixmap_item)
-            self.scene.addRect(QRectF(x, y, image.width(), image.height()), pen)
+            rect = self.scene.addRect(QRectF(x, y, image.width(), image.height()), pen)
+            rect.setVisible(self.show_grid.isChecked())
+            self.grid_rects.append(rect)
             self.tile_graphics.append((pixmap_item, array))
 
         self.scene.setSceneRect(self.scene.itemsBoundingRect())
@@ -332,6 +368,33 @@ class RawTileGridWindow(QMainWindow):
             return
         for pixmap_item, array in self.tile_graphics:
             pixmap_item.setPixmap(QPixmap.fromImage(self.array_to_qimage(array)))
+
+    def update_grid_visibility(self) -> None:
+        visible = self.show_grid.isChecked()
+        for rect in self.grid_rects:
+            rect.setVisible(visible)
+
+    def select_tile(self, tile_item: TilePixmapItem) -> None:
+        self.selected_tile = tile_item
+        scene_rect = tile_item.sceneBoundingRect()
+        if self.selection_rect is None:
+            pen = QPen(QColor(255, 220, 0), 4)
+            self.selection_rect = self.scene.addRect(scene_rect, pen)
+            self.selection_rect.setZValue(10)
+        else:
+            self.selection_rect.setRect(scene_rect)
+        plane = tile_item.plane
+        self.selected_tile_info.setPlainText(
+            f"Channel: {plane.channel}\n"
+            f"Stage X/Y: {plane.stage_x_raw}, {plane.stage_y_raw}\n"
+            f"Grid col/row: {plane.col_index}, {plane.row_index}\n"
+            f"Middle Z: {plane.z_rel_raw} ({plane.z_rel_um:.1f} um), z index {plane.z_index}\n"
+            f"Path: {plane.path}"
+        )
+        self.log_message(
+            f"Selected tile {plane.channel} x={plane.stage_x_raw} y={plane.stage_y_raw} "
+            f"z={plane.z_rel_raw}"
+        )
 
     def fit_mosaic(self) -> None:
         if self.scene.items():
