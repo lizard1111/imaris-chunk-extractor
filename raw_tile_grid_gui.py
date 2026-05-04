@@ -10,7 +10,7 @@ from typing import Any
 
 import imageio.v3 as iio
 import numpy as np
-from PyQt5.QtCore import QRectF, Qt, QThread, pyqtSignal
+from PyQt5.QtCore import QPoint, QRectF, Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
@@ -64,10 +64,41 @@ class ZoomableGraphicsView(QGraphicsView):
     def __init__(self, scene: QGraphicsScene) -> None:
         super().__init__(scene)
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+        self.is_panning = False
+        self.last_pan_pos = QPoint()
 
     def wheelEvent(self, event: Any) -> None:
         zoom_factor = 1.25 if event.angleDelta().y() > 0 else 0.8
         self.scale(zoom_factor, zoom_factor)
+
+    def mousePressEvent(self, event: Any) -> None:
+        if event.button() == Qt.RightButton or (
+            event.button() == Qt.LeftButton and event.modifiers() & Qt.MetaModifier
+        ):
+            self.is_panning = True
+            self.last_pan_pos = event.pos()
+            self.setCursor(Qt.ClosedHandCursor)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: Any) -> None:
+        if self.is_panning:
+            delta = event.pos() - self.last_pan_pos
+            self.last_pan_pos = event.pos()
+            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - delta.x())
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: Any) -> None:
+        if self.is_panning and event.button() in {Qt.RightButton, Qt.LeftButton}:
+            self.is_panning = False
+            self.setCursor(Qt.ArrowCursor)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
 
 class ScanChannelsWorker(QThread):
@@ -156,11 +187,12 @@ class TileDiagnosticsWorker(QThread):
     finished_ok = pyqtSignal(object)
     failed = pyqtSignal(str)
 
-    def __init__(self, tile_dir: Path, display_min: int, display_max: int) -> None:
+    def __init__(self, tile_dir: Path, display_min: int, display_max: int, slice_step: int) -> None:
         super().__init__()
         self.tile_dir = tile_dir
         self.display_min = display_min
         self.display_max = display_max
+        self.slice_step = max(1, slice_step)
 
     def run(self) -> None:
         try:
@@ -168,35 +200,47 @@ class TileDiagnosticsWorker(QThread):
             if not png_paths:
                 raise ValueError(f"No PNG files found in {self.tile_dir}")
 
+            selected_paths = png_paths[:: self.slice_step]
+            if png_paths[-1] not in selected_paths:
+                selected_paths.append(png_paths[-1])
+
             planes: list[np.ndarray] = []
-            total = len(png_paths)
-            for index, path in enumerate(png_paths, start=1):
-                if index == 1 or index == total or index % 100 == 0:
-                    self.progress.emit(index, total, f"Loading {path.name}")
+            total = len(selected_paths)
+            for index, path in enumerate(selected_paths, start=1):
+                self.progress.emit(index, total, f"Loading {path.name}")
                 array = iio.imread(path)
                 if array.ndim == 3:
                     array = array[..., 0]
                 planes.append(np.asarray(array, dtype=np.float32))
+            self.progress.emit(0, 0, "Stacking sampled slices...")
             stack = np.stack(planes, axis=0)
             middle = stack[stack.shape[0] // 2]
+            self.progress.emit(1, 6, "Calculating mean projection...")
             mean_projection = np.mean(stack, axis=0)
+            self.progress.emit(2, 6, "Calculating median projection...")
             median_projection = np.median(stack, axis=0)
+            self.progress.emit(3, 6, "Calculating standard deviation projection...")
             std_projection = np.std(stack, axis=0)
+            self.progress.emit(4, 6, "Calculating low-percentile projection...")
             low_projection = np.percentile(stack, 10, axis=0)
 
             try:
                 from scipy import ndimage
 
+                self.progress.emit(5, 6, "Estimating blurred flatfield...")
                 flatfield = ndimage.gaussian_filter(low_projection, sigma=120)
             except ImportError:
                 flatfield = low_projection
             flatfield = np.maximum(flatfield, np.percentile(flatfield, 1))
+            self.progress.emit(6, 6, "Calculating corrected preview...")
             corrected = middle / flatfield * np.median(flatfield)
 
             self.finished_ok.emit(
                 {
                     "tile_dir": self.tile_dir,
                     "n_planes": stack.shape[0],
+                    "total_planes": len(png_paths),
+                    "slice_step": self.slice_step,
                     "shape": stack.shape,
                     "middle": middle,
                     "mean": mean_projection,
@@ -233,11 +277,18 @@ class ImagePreview(QLabel):
 
 
 class TileDiagnosticsWindow(QMainWindow):
-    def __init__(self, plane: RawTilePlane, display_min: int, display_max: int) -> None:
+    def __init__(
+        self,
+        plane: RawTilePlane,
+        display_min: int,
+        display_max: int,
+        slice_step: int,
+    ) -> None:
         super().__init__()
         self.plane = plane
         self.display_min = display_min
         self.display_max = display_max
+        self.slice_step = slice_step
         self.worker: TileDiagnosticsWorker | None = None
         self.results: dict[str, Any] = {}
         self.setWindowTitle(f"Tile Diagnostics - {plane.channel} {plane.stage_x_raw}_{plane.stage_y_raw}")
@@ -296,6 +347,7 @@ class TileDiagnosticsWindow(QMainWindow):
             self.plane.path.parent,
             display_min=self.display_min,
             display_max=self.display_max,
+            slice_step=self.slice_step,
         )
         self.worker.progress.connect(self.on_progress)
         self.worker.finished_ok.connect(self.on_finished)
@@ -303,6 +355,10 @@ class TileDiagnosticsWindow(QMainWindow):
         self.worker.start()
 
     def on_progress(self, current: int, total: int, message: str) -> None:
+        if total <= 0:
+            self.status_label.setText(message)
+            self.progress_bar.setRange(0, 0)
+            return
         self.status_label.setText(f"{message} ({current}/{total})")
         self.progress_bar.setRange(0, max(1, total))
         self.progress_bar.setValue(current)
@@ -316,8 +372,9 @@ class TileDiagnosticsWindow(QMainWindow):
             preview.set_array(results[key], self.display_min, self.display_max)
         self.summary.setPlainText(
             f"Tile: {results['tile_dir']}\n"
-            f"Stack shape z,y,x: {results['shape']}\n"
-            f"Planes: {results['n_planes']}\n"
+            f"Sampled stack shape z,y,x: {results['shape']}\n"
+            f"Sampled planes: {results['n_planes']} of {results['total_planes']} "
+            f"(every {results['slice_step']} slice(s))\n"
             "Flatfield preview: 10th-percentile Z projection with heavy Gaussian blur."
         )
 
@@ -366,6 +423,9 @@ class RawTileGridWindow(QMainWindow):
         self.display_max.setRange(1, 65535)
         self.display_max.setValue(500)
         self.display_max.valueChanged.connect(self.update_live_contrast)
+        self.diagnostic_slice_step = QSpinBox()
+        self.diagnostic_slice_step.setRange(1, 1000)
+        self.diagnostic_slice_step.setValue(10)
         self.status_label = QLabel("Ready")
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 1)
@@ -423,7 +483,9 @@ class RawTileGridWindow(QMainWindow):
         controls_layout.addWidget(self.display_max, 6, 1)
         controls_layout.addWidget(fit, 5, 2)
         controls_layout.addWidget(actual, 6, 2)
-        controls_layout.addWidget(diagnostics, 6, 3)
+        controls_layout.addWidget(QLabel("Diag slice step"), 7, 0)
+        controls_layout.addWidget(self.diagnostic_slice_step, 7, 1)
+        controls_layout.addWidget(diagnostics, 7, 2)
 
         progress_layout = QHBoxLayout()
         progress_layout.addWidget(self.status_label)
@@ -585,6 +647,7 @@ class RawTileGridWindow(QMainWindow):
             self.selected_tile.plane,
             display_min=self.display_min.value(),
             display_max=self.display_max.value(),
+            slice_step=self.diagnostic_slice_step.value(),
         )
         self.diagnostics_windows.append(window)
         window.show()
