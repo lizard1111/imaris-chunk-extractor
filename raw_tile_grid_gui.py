@@ -151,6 +151,183 @@ class BuildMosaicWorker(QThread):
             return array[::stride, ::stride]
 
 
+class TileDiagnosticsWorker(QThread):
+    progress = pyqtSignal(int, int, str)
+    finished_ok = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, tile_dir: Path, display_min: int, display_max: int) -> None:
+        super().__init__()
+        self.tile_dir = tile_dir
+        self.display_min = display_min
+        self.display_max = display_max
+
+    def run(self) -> None:
+        try:
+            png_paths = sorted(self.tile_dir.glob("*.png"), key=lambda path: int(path.stem))
+            if not png_paths:
+                raise ValueError(f"No PNG files found in {self.tile_dir}")
+
+            planes: list[np.ndarray] = []
+            total = len(png_paths)
+            for index, path in enumerate(png_paths, start=1):
+                if index == 1 or index == total or index % 100 == 0:
+                    self.progress.emit(index, total, f"Loading {path.name}")
+                array = iio.imread(path)
+                if array.ndim == 3:
+                    array = array[..., 0]
+                planes.append(np.asarray(array, dtype=np.float32))
+            stack = np.stack(planes, axis=0)
+            middle = stack[stack.shape[0] // 2]
+            mean_projection = np.mean(stack, axis=0)
+            median_projection = np.median(stack, axis=0)
+            std_projection = np.std(stack, axis=0)
+            low_projection = np.percentile(stack, 10, axis=0)
+
+            try:
+                from scipy import ndimage
+
+                flatfield = ndimage.gaussian_filter(low_projection, sigma=120)
+            except ImportError:
+                flatfield = low_projection
+            flatfield = np.maximum(flatfield, np.percentile(flatfield, 1))
+            corrected = middle / flatfield * np.median(flatfield)
+
+            self.finished_ok.emit(
+                {
+                    "tile_dir": self.tile_dir,
+                    "n_planes": stack.shape[0],
+                    "shape": stack.shape,
+                    "middle": middle,
+                    "mean": mean_projection,
+                    "median": median_projection,
+                    "std": std_projection,
+                    "low": low_projection,
+                    "flatfield": flatfield,
+                    "corrected": corrected,
+                }
+            )
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+
+
+class ImagePreview(QLabel):
+    def __init__(self, title: str) -> None:
+        super().__init__()
+        self.title = title
+        self.setAlignment(Qt.AlignCenter)
+        self.setMinimumSize(220, 220)
+        self.setStyleSheet("background: #111; border: 1px solid #444;")
+
+    def set_array(self, array: np.ndarray, display_min: float, display_max: float) -> None:
+        finite = np.asarray(array, dtype=np.float32)
+        high = display_max if display_max > display_min else display_min + 1.0
+        scaled = ((finite - display_min) * 255.0 / (high - display_min)).clip(0, 255).astype(np.uint8)
+        height, width = scaled.shape
+        image = QImage(scaled.data, width, height, width, QImage.Format_Grayscale8).copy()
+        pixmap = QPixmap.fromImage(image).scaled(
+            self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+        self.setPixmap(pixmap)
+        self.setToolTip(self.title)
+
+
+class TileDiagnosticsWindow(QMainWindow):
+    def __init__(self, plane: RawTilePlane, display_min: int, display_max: int) -> None:
+        super().__init__()
+        self.plane = plane
+        self.display_min = display_min
+        self.display_max = display_max
+        self.worker: TileDiagnosticsWorker | None = None
+        self.results: dict[str, Any] = {}
+        self.setWindowTitle(f"Tile Diagnostics - {plane.channel} {plane.stage_x_raw}_{plane.stage_y_raw}")
+        self.resize(1100, 780)
+
+        self.status_label = QLabel("Ready")
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(0)
+        self.summary = QTextEdit()
+        self.summary.setReadOnly(True)
+        self.summary.setMaximumHeight(120)
+        self.previews = {
+            "middle": ImagePreview("Middle slice"),
+            "mean": ImagePreview("Mean projection"),
+            "median": ImagePreview("Median projection"),
+            "low": ImagePreview("10th percentile projection"),
+            "flatfield": ImagePreview("Estimated flatfield"),
+            "corrected": ImagePreview("Corrected middle slice preview"),
+        }
+        self.setCentralWidget(self.build_ui())
+        self.run_diagnostics()
+
+    def build_ui(self) -> QWidget:
+        root = QWidget()
+        layout = QVBoxLayout(root)
+        grid = QGridLayout()
+        labels = {
+            "middle": "Middle",
+            "mean": "Mean Z",
+            "median": "Median Z",
+            "low": "Low Percentile",
+            "flatfield": "Flatfield",
+            "corrected": "Corrected Middle",
+        }
+        for index, key in enumerate(labels):
+            row = index // 3
+            col = index % 3
+            cell = QVBoxLayout()
+            cell.addWidget(QLabel(labels[key]))
+            cell.addWidget(self.previews[key])
+            grid.addLayout(cell, row, col)
+
+        progress_layout = QHBoxLayout()
+        progress_layout.addWidget(self.status_label)
+        progress_layout.addWidget(self.progress_bar)
+        layout.addWidget(self.summary)
+        layout.addLayout(grid, stretch=1)
+        layout.addLayout(progress_layout)
+        return root
+
+    def run_diagnostics(self) -> None:
+        self.status_label.setText("Loading stack...")
+        self.progress_bar.setRange(0, 0)
+        self.worker = TileDiagnosticsWorker(
+            self.plane.path.parent,
+            display_min=self.display_min,
+            display_max=self.display_max,
+        )
+        self.worker.progress.connect(self.on_progress)
+        self.worker.finished_ok.connect(self.on_finished)
+        self.worker.failed.connect(self.on_failed)
+        self.worker.start()
+
+    def on_progress(self, current: int, total: int, message: str) -> None:
+        self.status_label.setText(f"{message} ({current}/{total})")
+        self.progress_bar.setRange(0, max(1, total))
+        self.progress_bar.setValue(current)
+
+    def on_finished(self, results: dict[str, Any]) -> None:
+        self.results = results
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(0)
+        self.status_label.setText("Ready")
+        for key, preview in self.previews.items():
+            preview.set_array(results[key], self.display_min, self.display_max)
+        self.summary.setPlainText(
+            f"Tile: {results['tile_dir']}\n"
+            f"Stack shape z,y,x: {results['shape']}\n"
+            f"Planes: {results['n_planes']}\n"
+            "Flatfield preview: 10th-percentile Z projection with heavy Gaussian blur."
+        )
+
+    def on_failed(self, details: str) -> None:
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(0)
+        self.status_label.setText("Ready")
+        self.summary.setPlainText(details)
+
+
 class RawTileGridWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -165,6 +342,7 @@ class RawTileGridWindow(QMainWindow):
         self.grid_rects: list[QGraphicsRectItem] = []
         self.selected_tile: TilePixmapItem | None = None
         self.selection_rect: QGraphicsRectItem | None = None
+        self.diagnostics_windows: list[TileDiagnosticsWindow] = []
 
         self.root_path = QLineEdit()
         self.channel_combo = QComboBox()
@@ -221,6 +399,8 @@ class RawTileGridWindow(QMainWindow):
         fit.clicked.connect(self.fit_mosaic)
         actual = QPushButton("100%")
         actual.clicked.connect(self.actual_size)
+        diagnostics = QPushButton("Tile Diagnostics")
+        diagnostics.clicked.connect(self.open_tile_diagnostics)
 
         controls_layout.addWidget(QLabel("Root"), 0, 0)
         controls_layout.addWidget(self.root_path, 0, 1)
@@ -243,6 +423,7 @@ class RawTileGridWindow(QMainWindow):
         controls_layout.addWidget(self.display_max, 6, 1)
         controls_layout.addWidget(fit, 5, 2)
         controls_layout.addWidget(actual, 6, 2)
+        controls_layout.addWidget(diagnostics, 6, 3)
 
         progress_layout = QHBoxLayout()
         progress_layout.addWidget(self.status_label)
@@ -395,6 +576,18 @@ class RawTileGridWindow(QMainWindow):
             f"Selected tile {plane.channel} x={plane.stage_x_raw} y={plane.stage_y_raw} "
             f"z={plane.z_rel_raw}"
         )
+
+    def open_tile_diagnostics(self) -> None:
+        if self.selected_tile is None:
+            self.show_error("Select a tile first.")
+            return
+        window = TileDiagnosticsWindow(
+            self.selected_tile.plane,
+            display_min=self.display_min.value(),
+            display_max=self.display_max.value(),
+        )
+        self.diagnostics_windows.append(window)
+        window.show()
 
     def fit_mosaic(self) -> None:
         if self.scene.items():
