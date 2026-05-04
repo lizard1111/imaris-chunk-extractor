@@ -12,6 +12,7 @@ imaris_chunk_tool/
   transforms.py     # chunk-to-original affine coordinate transforms
   extraction.py     # crop/rotated extraction and metadata sidecars
   annotations.py    # point CSV export
+  raw_tiles.py      # raw PNG tile-folder discovery
   cli.py            # command-line interface
 ```
 
@@ -50,6 +51,29 @@ channel/timepoint/resolution, choose the extraction center, optionally apply
 X/Y/Z rotations in degrees, and extract a test chunk. It can also open the
 extracted `.tif` or `.npy` stack, browse orthogonal XY/XZ/YZ views, record
 clicked `x,y,z` points, and save those points as CSV.
+
+## Open The Raw PNG Tile Grid GUI
+
+```bash
+python raw_tile_grid_gui.py
+```
+
+The raw PNG grid viewer expects acquisition folders like:
+
+```text
+RawDataset/
+  Ex_488_Ch0/
+    453370/
+      453370_578470/
+        000000.png
+        000020.png
+```
+
+It treats the channel folder as the channel, the column folder as raw stage X,
+the tile folder as raw stage X/Y, and the PNG filename as relative Z movement.
+For example, `000020.png` is interpreted as `2.0 um` relative Z. The overview
+uses the middle Z plane from each tile stack and lays adjacent tiles out with a
+default 10% overlap.
 
 ## Check What Is In The File
 
