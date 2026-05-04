@@ -15,6 +15,7 @@ from PyQt5.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
     QComboBox,
+    QCheckBox,
     QFileDialog,
     QGraphicsPixmapItem,
     QGraphicsScene,
@@ -70,6 +71,7 @@ class BuildMosaicWorker(QThread):
         overlap_fraction: float,
         display_min: int,
         display_max: int,
+        flip_vertical: bool,
     ) -> None:
         super().__init__()
         self.channel_dir = channel_dir
@@ -77,6 +79,7 @@ class BuildMosaicWorker(QThread):
         self.overlap_fraction = overlap_fraction
         self.display_min = display_min
         self.display_max = display_max
+        self.flip_vertical = flip_vertical
 
     def run(self) -> None:
         try:
@@ -103,8 +106,9 @@ class BuildMosaicWorker(QThread):
             step_y = max(1, int(round(tile_height * (1.0 - self.overlap_fraction))))
             items: list[tuple[RawTilePlane, QImage, int, int]] = []
             for plane, image in loaded:
+                row_index = grid.n_rows - 1 - plane.row_index if self.flip_vertical else plane.row_index
                 x = plane.col_index * step_x
-                y = plane.row_index * step_y
+                y = row_index * step_y
                 items.append((plane, image, x, y))
             self.finished_ok.emit(grid, items, step_x, step_y)
         except Exception:
@@ -142,6 +146,8 @@ class RawTileGridWindow(QMainWindow):
         self.overlap_percent = QSpinBox()
         self.overlap_percent.setRange(0, 50)
         self.overlap_percent.setValue(int(DEFAULT_TILE_OVERLAP_FRACTION * 100))
+        self.flip_vertical = QCheckBox()
+        self.flip_vertical.setChecked(True)
         self.display_min = QSpinBox()
         self.display_min.setRange(0, 65535)
         self.display_min.setValue(0)
@@ -186,10 +192,12 @@ class RawTileGridWindow(QMainWindow):
         controls_layout.addWidget(build, 2, 2)
         controls_layout.addWidget(QLabel("Tile overlap %"), 3, 0)
         controls_layout.addWidget(self.overlap_percent, 3, 1)
-        controls_layout.addWidget(QLabel("Display min"), 4, 0)
-        controls_layout.addWidget(self.display_min, 4, 1)
-        controls_layout.addWidget(QLabel("Display max"), 5, 0)
-        controls_layout.addWidget(self.display_max, 5, 1)
+        controls_layout.addWidget(QLabel("Flip vertical"), 4, 0)
+        controls_layout.addWidget(self.flip_vertical, 4, 1)
+        controls_layout.addWidget(QLabel("Display min"), 5, 0)
+        controls_layout.addWidget(self.display_min, 5, 1)
+        controls_layout.addWidget(QLabel("Display max"), 6, 0)
+        controls_layout.addWidget(self.display_max, 6, 1)
 
         progress_layout = QHBoxLayout()
         progress_layout.addWidget(self.status_label)
@@ -240,6 +248,7 @@ class RawTileGridWindow(QMainWindow):
             overlap_fraction=self.overlap_percent.value() / 100.0,
             display_min=self.display_min.value(),
             display_max=self.display_max.value(),
+            flip_vertical=self.flip_vertical.isChecked(),
         )
         self.mosaic_worker.progress.connect(self.on_mosaic_progress)
         self.mosaic_worker.finished_ok.connect(self.on_mosaic_finished)
@@ -280,7 +289,8 @@ class RawTileGridWindow(QMainWindow):
             f"Rendered {len(items)} tile(s) for {grid.channel}: "
             f"{grid.n_cols} columns x {grid.n_rows} rows, "
             f"thumbnail={self.thumbnail_size.value()}px, step_x={step_x}px, step_y={step_y}px, "
-            f"display={self.display_min.value()}-{self.display_max.value()}."
+            f"display={self.display_min.value()}-{self.display_max.value()}, "
+            f"flip_vertical={self.flip_vertical.isChecked()}."
         )
 
     def set_busy(self, message: str, busy: bool) -> None:
