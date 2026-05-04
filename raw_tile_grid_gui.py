@@ -8,6 +8,8 @@ import traceback
 from pathlib import Path
 from typing import Any
 
+import imageio.v3 as iio
+import numpy as np
 from PyQt5.QtCore import QRectF, Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
@@ -61,39 +63,65 @@ class BuildMosaicWorker(QThread):
     finished_ok = pyqtSignal(object, list, int, int)
     failed = pyqtSignal(str)
 
-    def __init__(self, channel_dir: Path, thumbnail_size: int, overlap_fraction: float) -> None:
+    def __init__(
+        self,
+        channel_dir: Path,
+        thumbnail_size: int,
+        overlap_fraction: float,
+        display_min: int,
+        display_max: int,
+    ) -> None:
         super().__init__()
         self.channel_dir = channel_dir
         self.thumbnail_size = thumbnail_size
         self.overlap_fraction = overlap_fraction
+        self.display_min = display_min
+        self.display_max = display_max
 
     def run(self) -> None:
         try:
             grid = discover_channel_grid(self.channel_dir)
-            items: list[tuple[RawTilePlane, QImage, int, int]] = []
+            loaded: list[tuple[RawTilePlane, QImage]] = []
             total = len(grid.stacks)
-            step_px = max(1, int(round(self.thumbnail_size * (1.0 - self.overlap_fraction))))
             for index, stack in enumerate(grid.stacks, start=1):
                 plane = stack.middle_plane
                 if plane is None:
                     continue
                 self.progress.emit(index, total, f"Loading {plane.path.name}")
-                image = QImage(str(plane.path))
-                if image.isNull():
-                    continue
-                image = image.convertToFormat(QImage.Format_Grayscale8)
+                image = self.load_contrast_image(plane.path)
                 thumb = image.scaled(
                     self.thumbnail_size,
                     self.thumbnail_size,
                     Qt.KeepAspectRatio,
                     Qt.SmoothTransformation,
                 )
-                x = stack.col_index * step_px
-                y = stack.row_index * step_px
-                items.append((plane, thumb, x, y))
-            self.finished_ok.emit(grid, items, step_px, self.thumbnail_size)
+                loaded.append((plane, thumb))
+
+            tile_width = max((image.width() for _plane, image in loaded), default=self.thumbnail_size)
+            tile_height = max((image.height() for _plane, image in loaded), default=self.thumbnail_size)
+            step_x = max(1, int(round(tile_width * (1.0 - self.overlap_fraction))))
+            step_y = max(1, int(round(tile_height * (1.0 - self.overlap_fraction))))
+            items: list[tuple[RawTilePlane, QImage, int, int]] = []
+            for plane, image in loaded:
+                x = plane.col_index * step_x
+                y = plane.row_index * step_y
+                items.append((plane, image, x, y))
+            self.finished_ok.emit(grid, items, step_x, step_y)
         except Exception:
             self.failed.emit(traceback.format_exc())
+
+    def load_contrast_image(self, path: Path) -> QImage:
+        array = iio.imread(path)
+        if array.ndim == 3:
+            array = array[..., 0]
+        finite = np.asarray(array, dtype=np.float32)
+        low = float(self.display_min)
+        high = float(self.display_max)
+        if high <= low:
+            high = low + 1.0
+        scaled = ((finite - low) * 255.0 / (high - low)).clip(0, 255).astype(np.uint8)
+        height, width = scaled.shape
+        return QImage(scaled.data, width, height, width, QImage.Format_Grayscale8).copy()
 
 
 class RawTileGridWindow(QMainWindow):
@@ -114,6 +142,12 @@ class RawTileGridWindow(QMainWindow):
         self.overlap_percent = QSpinBox()
         self.overlap_percent.setRange(0, 50)
         self.overlap_percent.setValue(int(DEFAULT_TILE_OVERLAP_FRACTION * 100))
+        self.display_min = QSpinBox()
+        self.display_min.setRange(0, 65535)
+        self.display_min.setValue(0)
+        self.display_max = QSpinBox()
+        self.display_max.setRange(1, 65535)
+        self.display_max.setValue(500)
         self.status_label = QLabel("Ready")
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 1)
@@ -152,6 +186,10 @@ class RawTileGridWindow(QMainWindow):
         controls_layout.addWidget(build, 2, 2)
         controls_layout.addWidget(QLabel("Tile overlap %"), 3, 0)
         controls_layout.addWidget(self.overlap_percent, 3, 1)
+        controls_layout.addWidget(QLabel("Display min"), 4, 0)
+        controls_layout.addWidget(self.display_min, 4, 1)
+        controls_layout.addWidget(QLabel("Display max"), 5, 0)
+        controls_layout.addWidget(self.display_max, 5, 1)
 
         progress_layout = QHBoxLayout()
         progress_layout.addWidget(self.status_label)
@@ -200,6 +238,8 @@ class RawTileGridWindow(QMainWindow):
             channel_dir=channel_dir,
             thumbnail_size=self.thumbnail_size.value(),
             overlap_fraction=self.overlap_percent.value() / 100.0,
+            display_min=self.display_min.value(),
+            display_max=self.display_max.value(),
         )
         self.mosaic_worker.progress.connect(self.on_mosaic_progress)
         self.mosaic_worker.finished_ok.connect(self.on_mosaic_finished)
@@ -215,15 +255,15 @@ class RawTileGridWindow(QMainWindow):
         self,
         grid: RawChannelGrid,
         items: list[tuple[RawTilePlane, QImage, int, int]],
-        step_px: int,
-        thumbnail_size: int,
+        step_x: int,
+        step_y: int,
     ) -> None:
         self.current_grid = grid
         self.scene.clear()
         pen = QPen(QColor(0, 180, 255), 1)
         for plane, image, x, y in items:
             pixmap_item = QGraphicsPixmapItem(QPixmap.fromImage(image))
-            pixmap_item.setOffset(x, y)
+            pixmap_item.setPos(x, y)
             pixmap_item.setToolTip(
                 f"{plane.channel}\n"
                 f"stage x,y: {plane.stage_x_raw}, {plane.stage_y_raw}\n"
@@ -239,7 +279,8 @@ class RawTileGridWindow(QMainWindow):
         self.log_message(
             f"Rendered {len(items)} tile(s) for {grid.channel}: "
             f"{grid.n_cols} columns x {grid.n_rows} rows, "
-            f"thumbnail={thumbnail_size}px, step={step_px}px."
+            f"thumbnail={self.thumbnail_size.value()}px, step_x={step_x}px, step_y={step_y}px, "
+            f"display={self.display_min.value()}-{self.display_max.value()}."
         )
 
     def set_busy(self, message: str, busy: bool) -> None:
