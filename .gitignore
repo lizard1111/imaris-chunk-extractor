@@ -1,0 +1,10 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+*.ims
+*.tif
+*.tiff
+*.npy
+*.json
+*.points.csv
+*_chunks/
