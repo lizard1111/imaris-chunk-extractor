@@ -44,6 +44,16 @@ from imaris_chunk_tool.raw_tiles import (
 )
 
 
+class ZoomableGraphicsView(QGraphicsView):
+    def __init__(self, scene: QGraphicsScene) -> None:
+        super().__init__(scene)
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+
+    def wheelEvent(self, event: Any) -> None:
+        zoom_factor = 1.25 if event.angleDelta().y() > 0 else 0.8
+        self.scale(zoom_factor, zoom_factor)
+
+
 class ScanChannelsWorker(QThread):
     finished_ok = pyqtSignal(list)
     failed = pyqtSignal(str)
@@ -69,63 +79,60 @@ class BuildMosaicWorker(QThread):
         channel_dir: Path,
         thumbnail_size: int,
         overlap_fraction: float,
-        display_min: int,
-        display_max: int,
         flip_vertical: bool,
     ) -> None:
         super().__init__()
         self.channel_dir = channel_dir
         self.thumbnail_size = thumbnail_size
         self.overlap_fraction = overlap_fraction
-        self.display_min = display_min
-        self.display_max = display_max
         self.flip_vertical = flip_vertical
 
     def run(self) -> None:
         try:
             grid = discover_channel_grid(self.channel_dir)
-            loaded: list[tuple[RawTilePlane, QImage]] = []
+            loaded: list[tuple[RawTilePlane, np.ndarray]] = []
             total = len(grid.stacks)
             for index, stack in enumerate(grid.stacks, start=1):
                 plane = stack.middle_plane
                 if plane is None:
                     continue
                 self.progress.emit(index, total, f"Loading {plane.path.name}")
-                image = self.load_contrast_image(plane.path)
-                thumb = image.scaled(
-                    self.thumbnail_size,
-                    self.thumbnail_size,
-                    Qt.KeepAspectRatio,
-                    Qt.SmoothTransformation,
-                )
-                loaded.append((plane, thumb))
+                loaded.append((plane, self.load_array(plane.path)))
 
-            tile_width = max((image.width() for _plane, image in loaded), default=self.thumbnail_size)
-            tile_height = max((image.height() for _plane, image in loaded), default=self.thumbnail_size)
+            tile_width = max((array.shape[1] for _plane, array in loaded), default=self.thumbnail_size)
+            tile_height = max((array.shape[0] for _plane, array in loaded), default=self.thumbnail_size)
             step_x = max(1, int(round(tile_width * (1.0 - self.overlap_fraction))))
             step_y = max(1, int(round(tile_height * (1.0 - self.overlap_fraction))))
-            items: list[tuple[RawTilePlane, QImage, int, int]] = []
-            for plane, image in loaded:
+            items: list[tuple[RawTilePlane, np.ndarray, int, int]] = []
+            for plane, array in loaded:
                 row_index = grid.n_rows - 1 - plane.row_index if self.flip_vertical else plane.row_index
                 x = plane.col_index * step_x
                 y = row_index * step_y
-                items.append((plane, image, x, y))
+                items.append((plane, array, x, y))
             self.finished_ok.emit(grid, items, step_x, step_y)
         except Exception:
             self.failed.emit(traceback.format_exc())
 
-    def load_contrast_image(self, path: Path) -> QImage:
+    def load_array(self, path: Path) -> np.ndarray:
         array = iio.imread(path)
         if array.ndim == 3:
             array = array[..., 0]
-        finite = np.asarray(array, dtype=np.float32)
-        low = float(self.display_min)
-        high = float(self.display_max)
-        if high <= low:
-            high = low + 1.0
-        scaled = ((finite - low) * 255.0 / (high - low)).clip(0, 255).astype(np.uint8)
-        height, width = scaled.shape
-        return QImage(scaled.data, width, height, width, QImage.Format_Grayscale8).copy()
+        array = np.asarray(array)
+        if self.thumbnail_size <= 0:
+            return array
+
+        height, width = array.shape
+        scale = min(self.thumbnail_size / width, self.thumbnail_size / height)
+        if scale >= 1.0:
+            return array
+
+        try:
+            from scipy import ndimage
+
+            return ndimage.zoom(array, zoom=scale, order=1)
+        except ImportError:
+            stride = max(1, int(round(1.0 / scale)))
+            return array[::stride, ::stride]
 
 
 class RawTileGridWindow(QMainWindow):
@@ -137,12 +144,15 @@ class RawTileGridWindow(QMainWindow):
         self.mosaic_worker: BuildMosaicWorker | None = None
         self.channel_dirs: list[Path] = []
         self.current_grid: RawChannelGrid | None = None
+        self.mosaic_items: list[tuple[RawTilePlane, np.ndarray, int, int]] = []
+        self.tile_graphics: list[tuple[QGraphicsPixmapItem, np.ndarray]] = []
 
         self.root_path = QLineEdit()
         self.channel_combo = QComboBox()
         self.thumbnail_size = QSpinBox()
-        self.thumbnail_size.setRange(32, 1024)
-        self.thumbnail_size.setValue(192)
+        self.thumbnail_size.setRange(0, 8192)
+        self.thumbnail_size.setValue(0)
+        self.thumbnail_size.setSpecialValueText("Original")
         self.overlap_percent = QSpinBox()
         self.overlap_percent.setRange(0, 50)
         self.overlap_percent.setValue(int(DEFAULT_TILE_OVERLAP_FRACTION * 100))
@@ -151,9 +161,11 @@ class RawTileGridWindow(QMainWindow):
         self.display_min = QSpinBox()
         self.display_min.setRange(0, 65535)
         self.display_min.setValue(0)
+        self.display_min.valueChanged.connect(self.update_live_contrast)
         self.display_max = QSpinBox()
         self.display_max.setRange(1, 65535)
         self.display_max.setValue(500)
+        self.display_max.valueChanged.connect(self.update_live_contrast)
         self.status_label = QLabel("Ready")
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 1)
@@ -162,7 +174,7 @@ class RawTileGridWindow(QMainWindow):
         self.log.setReadOnly(True)
 
         self.scene = QGraphicsScene()
-        self.view = QGraphicsView(self.scene)
+        self.view = ZoomableGraphicsView(self.scene)
         self.view.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
         self.view.setDragMode(QGraphicsView.ScrollHandDrag)
 
@@ -180,6 +192,10 @@ class RawTileGridWindow(QMainWindow):
         scan.clicked.connect(self.scan_channels)
         build = QPushButton("Build Middle-Z Grid")
         build.clicked.connect(self.build_mosaic)
+        fit = QPushButton("Fit")
+        fit.clicked.connect(self.fit_mosaic)
+        actual = QPushButton("100%")
+        actual.clicked.connect(self.actual_size)
 
         controls_layout.addWidget(QLabel("Root"), 0, 0)
         controls_layout.addWidget(self.root_path, 0, 1)
@@ -198,6 +214,8 @@ class RawTileGridWindow(QMainWindow):
         controls_layout.addWidget(self.display_min, 5, 1)
         controls_layout.addWidget(QLabel("Display max"), 6, 0)
         controls_layout.addWidget(self.display_max, 6, 1)
+        controls_layout.addWidget(fit, 5, 2)
+        controls_layout.addWidget(actual, 6, 2)
 
         progress_layout = QHBoxLayout()
         progress_layout.addWidget(self.status_label)
@@ -246,8 +264,6 @@ class RawTileGridWindow(QMainWindow):
             channel_dir=channel_dir,
             thumbnail_size=self.thumbnail_size.value(),
             overlap_fraction=self.overlap_percent.value() / 100.0,
-            display_min=self.display_min.value(),
-            display_max=self.display_max.value(),
             flip_vertical=self.flip_vertical.isChecked(),
         )
         self.mosaic_worker.progress.connect(self.on_mosaic_progress)
@@ -263,14 +279,17 @@ class RawTileGridWindow(QMainWindow):
     def on_mosaic_finished(
         self,
         grid: RawChannelGrid,
-        items: list[tuple[RawTilePlane, QImage, int, int]],
+        items: list[tuple[RawTilePlane, np.ndarray, int, int]],
         step_x: int,
         step_y: int,
     ) -> None:
         self.current_grid = grid
+        self.mosaic_items = items
+        self.tile_graphics = []
         self.scene.clear()
         pen = QPen(QColor(0, 180, 255), 1)
-        for plane, image, x, y in items:
+        for plane, array, x, y in items:
+            image = self.array_to_qimage(array)
             pixmap_item = QGraphicsPixmapItem(QPixmap.fromImage(image))
             pixmap_item.setPos(x, y)
             pixmap_item.setToolTip(
@@ -281,17 +300,45 @@ class RawTileGridWindow(QMainWindow):
             )
             self.scene.addItem(pixmap_item)
             self.scene.addRect(QRectF(x, y, image.width(), image.height()), pen)
+            self.tile_graphics.append((pixmap_item, array))
 
         self.scene.setSceneRect(self.scene.itemsBoundingRect())
-        self.view.fitInView(self.scene.sceneRect(), Qt.KeepAspectRatio)
+        self.fit_mosaic()
         self.set_busy("Ready", False)
         self.log_message(
             f"Rendered {len(items)} tile(s) for {grid.channel}: "
             f"{grid.n_cols} columns x {grid.n_rows} rows, "
-            f"thumbnail={self.thumbnail_size.value()}px, step_x={step_x}px, step_y={step_y}px, "
+            f"thumbnail={self.thumbnail_label()}, step_x={step_x}px, step_y={step_y}px, "
             f"display={self.display_min.value()}-{self.display_max.value()}, "
             f"flip_vertical={self.flip_vertical.isChecked()}."
         )
+
+    def thumbnail_label(self) -> str:
+        value = self.thumbnail_size.value()
+        return "Original" if value == 0 else f"{value}px"
+
+    def array_to_qimage(self, array: np.ndarray) -> QImage:
+        finite = np.asarray(array, dtype=np.float32)
+        low = float(self.display_min.value())
+        high = float(self.display_max.value())
+        if high <= low:
+            high = low + 1.0
+        scaled = ((finite - low) * 255.0 / (high - low)).clip(0, 255).astype(np.uint8)
+        height, width = scaled.shape
+        return QImage(scaled.data, width, height, width, QImage.Format_Grayscale8).copy()
+
+    def update_live_contrast(self) -> None:
+        if not self.tile_graphics:
+            return
+        for pixmap_item, array in self.tile_graphics:
+            pixmap_item.setPixmap(QPixmap.fromImage(self.array_to_qimage(array)))
+
+    def fit_mosaic(self) -> None:
+        if self.scene.items():
+            self.view.fitInView(self.scene.sceneRect(), Qt.KeepAspectRatio)
+
+    def actual_size(self) -> None:
+        self.view.resetTransform()
 
     def set_busy(self, message: str, busy: bool) -> None:
         self.status_label.setText(message)
