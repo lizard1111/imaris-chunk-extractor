@@ -16,7 +16,9 @@ from PyQt5.QtWidgets import (
     QApplication,
     QComboBox,
     QCheckBox,
+    QDoubleSpinBox,
     QFileDialog,
+    QFormLayout,
     QGraphicsItem,
     QGraphicsPixmapItem,
     QGraphicsRectItem,
@@ -187,12 +189,22 @@ class TileDiagnosticsWorker(QThread):
     finished_ok = pyqtSignal(object)
     failed = pyqtSignal(str)
 
-    def __init__(self, tile_dir: Path, display_min: int, display_max: int, slice_step: int) -> None:
+    def __init__(
+        self,
+        tile_dir: Path,
+        display_min: int,
+        display_max: int,
+        slice_step: int,
+        use_pystripe: bool,
+        pystripe_params: dict[str, Any],
+    ) -> None:
         super().__init__()
         self.tile_dir = tile_dir
         self.display_min = display_min
         self.display_max = display_max
         self.slice_step = max(1, slice_step)
+        self.use_pystripe = use_pystripe
+        self.pystripe_params = pystripe_params
 
     def run(self) -> None:
         try:
@@ -204,6 +216,7 @@ class TileDiagnosticsWorker(QThread):
             if png_paths[-1] not in selected_paths:
                 selected_paths.append(png_paths[-1])
 
+            filter_streaks = self.load_pystripe() if self.use_pystripe else None
             planes: list[np.ndarray] = []
             total = len(selected_paths)
             for index, path in enumerate(selected_paths, start=1):
@@ -211,7 +224,21 @@ class TileDiagnosticsWorker(QThread):
                 array = iio.imread(path)
                 if array.ndim == 3:
                     array = array[..., 0]
-                planes.append(np.asarray(array, dtype=np.float32))
+                array = np.asarray(array, dtype=np.float32)
+                if filter_streaks is not None:
+                    self.progress.emit(index, total, f"PyStripe {path.name}")
+                    array = np.asarray(
+                        filter_streaks(
+                            array,
+                            sigma=[self.pystripe_params["sigma1"], self.pystripe_params["sigma2"]],
+                            level=self.pystripe_params["level"],
+                            wavelet=self.pystripe_params["wavelet"],
+                            crossover=self.pystripe_params["crossover"],
+                            threshold=self.pystripe_params["threshold"],
+                        ),
+                        dtype=np.float32,
+                    )
+                planes.append(array)
             self.progress.emit(0, 0, "Stacking sampled slices...")
             stack = np.stack(planes, axis=0)
             middle = stack[stack.shape[0] // 2]
@@ -249,10 +276,30 @@ class TileDiagnosticsWorker(QThread):
                     "low": low_projection,
                     "flatfield": flatfield,
                     "corrected": corrected,
+                    "use_pystripe": self.use_pystripe,
+                    "pystripe_params": self.pystripe_params,
                 }
             )
         except Exception:
             self.failed.emit(traceback.format_exc())
+
+    def load_pystripe(self) -> Any:
+        if not hasattr(np, "float"):
+            np.float = float
+        if not hasattr(np, "int"):
+            np.int = int
+        if not hasattr(np, "bool"):
+            np.bool = bool
+        if not hasattr(np, "complex"):
+            np.complex = complex
+        try:
+            from pystripe.core import filter_streaks
+        except ImportError as exc:
+            raise RuntimeError(
+                "PyStripe is not installed in this Python environment. "
+                "Install it in the preprocessing conda env to use this option."
+            ) from exc
+        return filter_streaks
 
 
 class ImagePreview(QLabel):
@@ -283,12 +330,16 @@ class TileDiagnosticsWindow(QMainWindow):
         display_min: int,
         display_max: int,
         slice_step: int,
+        use_pystripe: bool,
+        pystripe_params: dict[str, Any],
     ) -> None:
         super().__init__()
         self.plane = plane
         self.display_min = display_min
         self.display_max = display_max
         self.slice_step = slice_step
+        self.use_pystripe = use_pystripe
+        self.pystripe_params = pystripe_params
         self.worker: TileDiagnosticsWorker | None = None
         self.results: dict[str, Any] = {}
         self.setWindowTitle(f"Tile Diagnostics - {plane.channel} {plane.stage_x_raw}_{plane.stage_y_raw}")
@@ -348,6 +399,8 @@ class TileDiagnosticsWindow(QMainWindow):
             display_min=self.display_min,
             display_max=self.display_max,
             slice_step=self.slice_step,
+            use_pystripe=self.use_pystripe,
+            pystripe_params=self.pystripe_params,
         )
         self.worker.progress.connect(self.on_progress)
         self.worker.finished_ok.connect(self.on_finished)
@@ -375,6 +428,7 @@ class TileDiagnosticsWindow(QMainWindow):
             f"Sampled stack shape z,y,x: {results['shape']}\n"
             f"Sampled planes: {results['n_planes']} of {results['total_planes']} "
             f"(every {results['slice_step']} slice(s))\n"
+            f"PyStripe: {results['use_pystripe']} {results['pystripe_params'] if results['use_pystripe'] else ''}\n"
             "Flatfield preview: 10th-percentile Z projection with heavy Gaussian blur."
         )
 
@@ -426,6 +480,30 @@ class RawTileGridWindow(QMainWindow):
         self.diagnostic_slice_step = QSpinBox()
         self.diagnostic_slice_step.setRange(1, 1000)
         self.diagnostic_slice_step.setValue(10)
+        self.use_pystripe = QCheckBox()
+        self.use_pystripe.setChecked(False)
+        self.pystripe_wavelet = QComboBox()
+        self.pystripe_wavelet.addItems(["db3", "db5", "sym3", "coif1", "bior2.2"])
+        self.pystripe_sigma1 = QDoubleSpinBox()
+        self.pystripe_sigma1.setRange(0.0, 512.0)
+        self.pystripe_sigma1.setSingleStep(0.5)
+        self.pystripe_sigma1.setValue(25.6)
+        self.pystripe_sigma2 = QDoubleSpinBox()
+        self.pystripe_sigma2.setRange(0.0, 512.0)
+        self.pystripe_sigma2.setSingleStep(0.5)
+        self.pystripe_sigma2.setValue(25.6)
+        self.pystripe_level = QSpinBox()
+        self.pystripe_level.setRange(0, 8)
+        self.pystripe_level.setValue(0)
+        self.pystripe_level.setSpecialValueText("auto")
+        self.pystripe_crossover = QDoubleSpinBox()
+        self.pystripe_crossover.setRange(0.0, 100.0)
+        self.pystripe_crossover.setSingleStep(1.0)
+        self.pystripe_crossover.setValue(10.0)
+        self.pystripe_threshold = QDoubleSpinBox()
+        self.pystripe_threshold.setRange(-100.0, 100.0)
+        self.pystripe_threshold.setSingleStep(0.5)
+        self.pystripe_threshold.setValue(-1.0)
         self.status_label = QLabel("Ready")
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 1)
@@ -487,11 +565,22 @@ class RawTileGridWindow(QMainWindow):
         controls_layout.addWidget(self.diagnostic_slice_step, 7, 1)
         controls_layout.addWidget(diagnostics, 7, 2)
 
+        pystripe_group = QGroupBox("Diagnostics PyStripe")
+        pystripe_layout = QFormLayout(pystripe_group)
+        pystripe_layout.addRow("Enable", self.use_pystripe)
+        pystripe_layout.addRow("Wavelet", self.pystripe_wavelet)
+        pystripe_layout.addRow("Sigma 1", self.pystripe_sigma1)
+        pystripe_layout.addRow("Sigma 2", self.pystripe_sigma2)
+        pystripe_layout.addRow("Level", self.pystripe_level)
+        pystripe_layout.addRow("Crossover", self.pystripe_crossover)
+        pystripe_layout.addRow("Threshold", self.pystripe_threshold)
+
         progress_layout = QHBoxLayout()
         progress_layout.addWidget(self.status_label)
         progress_layout.addWidget(self.progress_bar)
 
         layout.addWidget(controls)
+        layout.addWidget(pystripe_group)
         layout.addWidget(self.view, stretch=1)
         layout.addWidget(QLabel("Selected Tile"))
         layout.addWidget(self.selected_tile_info)
@@ -648,9 +737,21 @@ class RawTileGridWindow(QMainWindow):
             display_min=self.display_min.value(),
             display_max=self.display_max.value(),
             slice_step=self.diagnostic_slice_step.value(),
+            use_pystripe=self.use_pystripe.isChecked(),
+            pystripe_params=self.pystripe_params(),
         )
         self.diagnostics_windows.append(window)
         window.show()
+
+    def pystripe_params(self) -> dict[str, Any]:
+        return {
+            "wavelet": self.pystripe_wavelet.currentText(),
+            "sigma1": self.pystripe_sigma1.value(),
+            "sigma2": self.pystripe_sigma2.value(),
+            "level": self.pystripe_level.value(),
+            "crossover": self.pystripe_crossover.value(),
+            "threshold": self.pystripe_threshold.value(),
+        }
 
     def fit_mosaic(self) -> None:
         if self.scene.items():
