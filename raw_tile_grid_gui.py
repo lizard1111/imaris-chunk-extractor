@@ -33,7 +33,9 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSpinBox,
+    QSplitter,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -46,6 +48,102 @@ from imaris_chunk_tool.raw_tiles import (
     discover_channel_dirs,
     discover_channel_grid,
 )
+
+
+def load_pystripe_filter() -> Any:
+    if not hasattr(np, "float"):
+        np.float = float
+    if not hasattr(np, "int"):
+        np.int = int
+    if not hasattr(np, "bool"):
+        np.bool = bool
+    if not hasattr(np, "complex"):
+        np.complex = complex
+    try:
+        from pystripe.core import filter_streaks
+    except ImportError as exc:
+        raise RuntimeError(
+            "PyStripe is not installed in this Python environment. "
+            "Install it in the preprocessing conda env to use this option."
+        ) from exc
+    return filter_streaks
+
+
+def generate_illumination_correction_map(
+    image_shape: tuple[int, int],
+    params: dict[str, Any],
+) -> np.ndarray | None:
+    if not params.get("enable_illumination", False):
+        return None
+
+    height, width = image_shape
+    tile_cols = max(1, int(params["illumination_tile_cols"]))
+    left_factor = float(params["illumination_left_factor"])
+    right_factor = float(params["illumination_right_factor"])
+    blend_width = max(0, int(params["illumination_blend_width"]))
+    correction_map = np.ones((height, width), dtype=np.float32)
+    tile_width = max(1, width // tile_cols)
+    left_cols = min(2, tile_cols // 2)
+    right_cols = min(2, tile_cols // 2)
+
+    for col in range(tile_cols):
+        x_start = col * tile_width
+        x_end = (col + 1) * tile_width if col < tile_cols - 1 else width
+        if col < left_cols:
+            correction_map[:, x_start:x_end] *= left_factor
+        elif col >= tile_cols - right_cols:
+            correction_map[:, x_start:x_end] *= right_factor
+
+    for col in range(1, tile_cols):
+        x_center = min(width - 1, col * tile_width)
+        blend_start = max(0, x_center - blend_width)
+        blend_end = min(width, x_center + blend_width)
+        if blend_width > 0 and blend_start < blend_end:
+            left_val = correction_map[height // 2, max(0, x_center - 1)]
+            right_val = correction_map[height // 2, x_center]
+            weights = np.linspace(0.0, 1.0, blend_end - blend_start, dtype=np.float32)
+            correction_map[:, blend_start:blend_end] = (
+                left_val * (1.0 - weights) + right_val * weights
+            )
+
+    if blend_width > 0:
+        try:
+            from scipy import ndimage
+
+            correction_map = ndimage.gaussian_filter(correction_map, sigma=(0, blend_width / 4.0))
+        except ImportError:
+            pass
+    return correction_map
+
+
+def apply_pystripe_pipeline(
+    array: np.ndarray,
+    filter_streaks: Any,
+    params: dict[str, Any],
+) -> np.ndarray:
+    if array.ndim == 3:
+        array = array[..., 0]
+    original_dtype = array.dtype
+    working = np.asarray(array)
+    correction_map = generate_illumination_correction_map(working.shape, params)
+    if correction_map is not None:
+        working = working.astype(np.float32) * correction_map
+
+    corrected = filter_streaks(
+        working,
+        sigma=[params["sigma1"], params["sigma2"]],
+        level=params["level"],
+        wavelet=params["wavelet"],
+        crossover=params["crossover"],
+        threshold=params["threshold"],
+        flat=None,
+        dark=params["dark"],
+    )
+    corrected = np.asarray(corrected)
+    if np.issubdtype(original_dtype, np.integer):
+        info = np.iinfo(original_dtype)
+        return np.clip(corrected, info.min, info.max).astype(original_dtype)
+    return corrected.astype(original_dtype, copy=False)
 
 
 class TilePixmapItem(QGraphicsPixmapItem):
@@ -218,6 +316,7 @@ class TileDiagnosticsWorker(QThread):
 
             filter_streaks = self.load_pystripe() if self.use_pystripe else None
             planes: list[np.ndarray] = []
+            original_planes: list[np.ndarray] = []
             total = len(selected_paths)
             for index, path in enumerate(selected_paths, start=1):
                 self.progress.emit(index, total, f"Loading {path.name}")
@@ -225,22 +324,18 @@ class TileDiagnosticsWorker(QThread):
                 if array.ndim == 3:
                     array = array[..., 0]
                 array = np.asarray(array, dtype=np.float32)
+                original_planes.append(array)
                 if filter_streaks is not None:
                     self.progress.emit(index, total, f"PyStripe {path.name}")
                     array = np.asarray(
-                        filter_streaks(
-                            array,
-                            sigma=[self.pystripe_params["sigma1"], self.pystripe_params["sigma2"]],
-                            level=self.pystripe_params["level"],
-                            wavelet=self.pystripe_params["wavelet"],
-                            crossover=self.pystripe_params["crossover"],
-                            threshold=self.pystripe_params["threshold"],
-                        ),
+                        apply_pystripe_pipeline(array, filter_streaks, self.pystripe_params),
                         dtype=np.float32,
                     )
                 planes.append(array)
             self.progress.emit(0, 0, "Stacking sampled slices...")
             stack = np.stack(planes, axis=0)
+            original_stack = np.stack(original_planes, axis=0)
+            original_middle = original_stack[original_stack.shape[0] // 2]
             middle = stack[stack.shape[0] // 2]
             self.progress.emit(1, 6, "Calculating mean projection...")
             mean_projection = np.mean(stack, axis=0)
@@ -269,6 +364,7 @@ class TileDiagnosticsWorker(QThread):
                     "total_planes": len(png_paths),
                     "slice_step": self.slice_step,
                     "shape": stack.shape,
+                    "original_middle": original_middle,
                     "middle": middle,
                     "mean": mean_projection,
                     "median": median_projection,
@@ -284,22 +380,90 @@ class TileDiagnosticsWorker(QThread):
             self.failed.emit(traceback.format_exc())
 
     def load_pystripe(self) -> Any:
-        if not hasattr(np, "float"):
-            np.float = float
-        if not hasattr(np, "int"):
-            np.int = int
-        if not hasattr(np, "bool"):
-            np.bool = bool
-        if not hasattr(np, "complex"):
-            np.complex = complex
+        return load_pystripe_filter()
+
+
+class PyStripeProcessWorker(QThread):
+    progress = pyqtSignal(int, int, str)
+    finished_ok = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(
+        self,
+        stacks: list[Any],
+        output_root: Path,
+        pystripe_params: dict[str, Any],
+    ) -> None:
+        super().__init__()
+        self.stacks = stacks
+        self.output_root = output_root
+        self.pystripe_params = pystripe_params
+
+    def run(self) -> None:
         try:
-            from pystripe.core import filter_streaks
-        except ImportError as exc:
-            raise RuntimeError(
-                "PyStripe is not installed in this Python environment. "
-                "Install it in the preprocessing conda env to use this option."
-            ) from exc
-        return filter_streaks
+            filter_streaks = load_pystripe_filter()
+            planes = [plane for stack in self.stacks for plane in stack.planes]
+            if not planes:
+                raise ValueError("No PNG planes found to process.")
+
+            total = len(planes)
+            written: list[Path] = []
+            for index, plane in enumerate(planes, start=1):
+                self.progress.emit(index, total, f"PyStripe {plane.path.name}")
+                array = iio.imread(plane.path)
+                corrected = apply_pystripe_pipeline(array, filter_streaks, self.pystripe_params)
+                output_path = (
+                    self.output_root
+                    / plane.channel
+                    / str(plane.stage_x_raw)
+                    / f"{plane.stage_x_raw}_{plane.stage_y_raw}"
+                    / plane.path.name
+                )
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                iio.imwrite(output_path, corrected)
+                written.append(output_path)
+
+            self.finished_ok.emit(
+                {
+                    "planes": total,
+                    "stacks": len(self.stacks),
+                    "output_root": self.output_root,
+                    "first_output": written[0],
+                    "last_output": written[-1],
+                    "pystripe_params": self.pystripe_params,
+                }
+            )
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+
+
+class PyStripeMosaicPreviewWorker(QThread):
+    progress = pyqtSignal(int, int, str)
+    finished_ok = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(
+        self,
+        items: list[tuple[RawTilePlane, np.ndarray]],
+        pystripe_params: dict[str, Any],
+    ) -> None:
+        super().__init__()
+        self.items = items
+        self.pystripe_params = pystripe_params
+
+    def run(self) -> None:
+        try:
+            filter_streaks = load_pystripe_filter()
+            processed: list[tuple[RawTilePlane, np.ndarray]] = []
+            total = len(self.items)
+            for index, (plane, array) in enumerate(self.items, start=1):
+                self.progress.emit(index, total, f"Preview PyStripe {plane.path.name}")
+                processed.append(
+                    (plane, apply_pystripe_pipeline(array, filter_streaks, self.pystripe_params))
+                )
+            self.finished_ok.emit(processed)
+        except Exception:
+            self.failed.emit(traceback.format_exc())
 
 
 class ImagePreview(QLabel):
@@ -321,6 +485,34 @@ class ImagePreview(QLabel):
         )
         self.setPixmap(pixmap)
         self.setToolTip(self.title)
+
+
+class ZoomableArrayPreview(QWidget):
+    def __init__(self, title: str) -> None:
+        super().__init__()
+        self.title_label = QLabel(title)
+        self.scene = QGraphicsScene()
+        self.view = ZoomableGraphicsView(self.scene)
+        self.view.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
+        self.pixmap_item = QGraphicsPixmapItem()
+        self.scene.addItem(self.pixmap_item)
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.title_label)
+        layout.addWidget(self.view, stretch=1)
+
+    def set_array(self, array: np.ndarray, display_min: float, display_max: float) -> None:
+        image = array_to_qimage(array, display_min, display_max)
+        self.pixmap_item.setPixmap(QPixmap.fromImage(image))
+        self.scene.setSceneRect(QRectF(0, 0, image.width(), image.height()))
+        self.view.fitInView(self.scene.sceneRect(), Qt.KeepAspectRatio)
+
+
+def array_to_qimage(array: np.ndarray, display_min: float, display_max: float) -> QImage:
+    finite = np.asarray(array, dtype=np.float32)
+    high = display_max if display_max > display_min else display_min + 1.0
+    scaled = ((finite - display_min) * 255.0 / (high - display_min)).clip(0, 255).astype(np.uint8)
+    height, width = scaled.shape
+    return QImage(scaled.data, width, height, width, QImage.Format_Grayscale8).copy()
 
 
 class TileDiagnosticsWindow(QMainWindow):
@@ -351,14 +543,15 @@ class TileDiagnosticsWindow(QMainWindow):
         self.progress_bar.setValue(0)
         self.summary = QTextEdit()
         self.summary.setReadOnly(True)
-        self.summary.setMaximumHeight(120)
+        self.summary.setMaximumHeight(90)
+        self.original_view = ZoomableArrayPreview("Original Middle Slice")
+        self.processed_view = ZoomableArrayPreview("Processed Middle Slice")
         self.previews = {
-            "middle": ImagePreview("Middle slice"),
             "mean": ImagePreview("Mean projection"),
             "median": ImagePreview("Median projection"),
             "low": ImagePreview("10th percentile projection"),
             "flatfield": ImagePreview("Estimated flatfield"),
-            "corrected": ImagePreview("Corrected middle slice preview"),
+            "corrected": ImagePreview("Flatfield corrected preview"),
         }
         self.setCentralWidget(self.build_ui())
         self.run_diagnostics()
@@ -366,14 +559,17 @@ class TileDiagnosticsWindow(QMainWindow):
     def build_ui(self) -> QWidget:
         root = QWidget()
         layout = QVBoxLayout(root)
+        compare = QSplitter(Qt.Horizontal)
+        compare.addWidget(self.original_view)
+        compare.addWidget(self.processed_view)
+        compare.setSizes([1, 1])
         grid = QGridLayout()
         labels = {
-            "middle": "Middle",
             "mean": "Mean Z",
             "median": "Median Z",
             "low": "Low Percentile",
             "flatfield": "Flatfield",
-            "corrected": "Corrected Middle",
+            "corrected": "Flatfield Corrected",
         }
         for index, key in enumerate(labels):
             row = index // 3
@@ -387,6 +583,7 @@ class TileDiagnosticsWindow(QMainWindow):
         progress_layout.addWidget(self.status_label)
         progress_layout.addWidget(self.progress_bar)
         layout.addWidget(self.summary)
+        layout.addWidget(compare, stretch=3)
         layout.addLayout(grid, stretch=1)
         layout.addLayout(progress_layout)
         return root
@@ -421,6 +618,8 @@ class TileDiagnosticsWindow(QMainWindow):
         self.progress_bar.setRange(0, 1)
         self.progress_bar.setValue(0)
         self.status_label.setText("Ready")
+        self.original_view.set_array(results["original_middle"], self.display_min, self.display_max)
+        self.processed_view.set_array(results["middle"], self.display_min, self.display_max)
         for key, preview in self.previews.items():
             preview.set_array(results[key], self.display_min, self.display_max)
         self.summary.setPlainText(
@@ -446,10 +645,13 @@ class RawTileGridWindow(QMainWindow):
         self.resize(1100, 800)
         self.scan_worker: ScanChannelsWorker | None = None
         self.mosaic_worker: BuildMosaicWorker | None = None
+        self.pystripe_worker: PyStripeProcessWorker | None = None
+        self.pystripe_preview_worker: PyStripeMosaicPreviewWorker | None = None
         self.channel_dirs: list[Path] = []
         self.current_grid: RawChannelGrid | None = None
         self.mosaic_items: list[tuple[RawTilePlane, np.ndarray, int, int]] = []
         self.tile_graphics: list[tuple[TilePixmapItem, np.ndarray]] = []
+        self.processed_mosaic_arrays: list[np.ndarray] | None = None
         self.grid_rects: list[QGraphicsRectItem] = []
         self.selected_tile: TilePixmapItem | None = None
         self.selection_rect: QGraphicsRectItem | None = None
@@ -482,6 +684,9 @@ class RawTileGridWindow(QMainWindow):
         self.diagnostic_slice_step.setValue(10)
         self.use_pystripe = QCheckBox()
         self.use_pystripe.setChecked(False)
+        self.preview_pystripe_grid = QCheckBox()
+        self.preview_pystripe_grid.setChecked(False)
+        self.preview_pystripe_grid.stateChanged.connect(self.update_pystripe_grid_preview)
         self.pystripe_wavelet = QComboBox()
         self.pystripe_wavelet.addItems(["db3", "db5", "sym3", "coif1", "bior2.2"])
         self.pystripe_sigma1 = QDoubleSpinBox()
@@ -504,15 +709,43 @@ class RawTileGridWindow(QMainWindow):
         self.pystripe_threshold.setRange(-100.0, 100.0)
         self.pystripe_threshold.setSingleStep(0.5)
         self.pystripe_threshold.setValue(-1.0)
+        self.pystripe_dark = QDoubleSpinBox()
+        self.pystripe_dark.setRange(0.0, 1000.0)
+        self.pystripe_dark.setSingleStep(1.0)
+        self.pystripe_dark.setValue(0.0)
+        self.output_root = QLineEdit()
+        self.pystripe_scope = QComboBox()
+        self.pystripe_scope.addItems(["Selected tile stack", "Current channel"])
+        self.enable_illumination = QCheckBox()
+        self.enable_illumination.setChecked(False)
+        self.illumination_tile_cols = QSpinBox()
+        self.illumination_tile_cols.setRange(1, 20)
+        self.illumination_tile_cols.setValue(4)
+        self.illumination_tile_rows = QSpinBox()
+        self.illumination_tile_rows.setRange(1, 20)
+        self.illumination_tile_rows.setValue(1)
+        self.illumination_left_factor = QDoubleSpinBox()
+        self.illumination_left_factor.setRange(0.5, 2.0)
+        self.illumination_left_factor.setSingleStep(0.05)
+        self.illumination_left_factor.setValue(1.0)
+        self.illumination_right_factor = QDoubleSpinBox()
+        self.illumination_right_factor.setRange(0.5, 2.0)
+        self.illumination_right_factor.setSingleStep(0.05)
+        self.illumination_right_factor.setValue(1.0)
+        self.illumination_blend_width = QSpinBox()
+        self.illumination_blend_width.setRange(0, 200)
+        self.illumination_blend_width.setValue(50)
+        self.connect_pystripe_preview_refresh()
         self.status_label = QLabel("Ready")
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 1)
         self.progress_bar.setValue(0)
         self.log = QTextEdit()
         self.log.setReadOnly(True)
+        self.log.setMaximumHeight(96)
         self.selected_tile_info = QTextEdit()
         self.selected_tile_info.setReadOnly(True)
-        self.selected_tile_info.setMaximumHeight(96)
+        self.selected_tile_info.setMaximumHeight(76)
 
         self.scene = QGraphicsScene()
         self.view = ZoomableGraphicsView(self.scene)
@@ -521,9 +754,33 @@ class RawTileGridWindow(QMainWindow):
 
         self.setCentralWidget(self.build_ui())
 
+    def connect_pystripe_preview_refresh(self) -> None:
+        self.pystripe_wavelet.currentTextChanged.connect(self.invalidate_pystripe_preview)
+        for spin_box in (
+            self.pystripe_sigma1,
+            self.pystripe_sigma2,
+            self.pystripe_level,
+            self.pystripe_crossover,
+            self.pystripe_threshold,
+            self.pystripe_dark,
+            self.illumination_tile_cols,
+            self.illumination_tile_rows,
+            self.illumination_left_factor,
+            self.illumination_right_factor,
+            self.illumination_blend_width,
+        ):
+            spin_box.valueChanged.connect(self.invalidate_pystripe_preview)
+        self.enable_illumination.stateChanged.connect(self.invalidate_pystripe_preview)
+
+    def invalidate_pystripe_preview(self, *_args: Any) -> None:
+        self.processed_mosaic_arrays = None
+        if self.preview_pystripe_grid.isChecked() and self.tile_graphics:
+            self.update_pystripe_grid_preview()
+
     def build_ui(self) -> QWidget:
         root = QWidget()
-        layout = QVBoxLayout(root)
+        layout = QHBoxLayout(root)
+        splitter = QSplitter(Qt.Horizontal)
 
         controls = QGroupBox("Raw Dataset")
         controls_layout = QGridLayout(controls)
@@ -539,6 +796,10 @@ class RawTileGridWindow(QMainWindow):
         actual.clicked.connect(self.actual_size)
         diagnostics = QPushButton("Tile Diagnostics")
         diagnostics.clicked.connect(self.open_tile_diagnostics)
+        browse_output = QPushButton("Browse")
+        browse_output.clicked.connect(self.choose_output_root)
+        process_pystripe = QPushButton("Export PNGs")
+        process_pystripe.clicked.connect(self.process_pystripe)
 
         controls_layout.addWidget(QLabel("Root"), 0, 0)
         controls_layout.addWidget(self.root_path, 0, 1)
@@ -565,35 +826,82 @@ class RawTileGridWindow(QMainWindow):
         controls_layout.addWidget(self.diagnostic_slice_step, 7, 1)
         controls_layout.addWidget(diagnostics, 7, 2)
 
-        pystripe_group = QGroupBox("Diagnostics PyStripe")
+        pystripe_group = QGroupBox("PyStripe")
         pystripe_layout = QFormLayout(pystripe_group)
-        pystripe_layout.addRow("Enable", self.use_pystripe)
+        pystripe_layout.addRow("Use in diagnostics", self.use_pystripe)
+        pystripe_layout.addRow("Preview grid", self.preview_pystripe_grid)
         pystripe_layout.addRow("Wavelet", self.pystripe_wavelet)
         pystripe_layout.addRow("Sigma 1", self.pystripe_sigma1)
         pystripe_layout.addRow("Sigma 2", self.pystripe_sigma2)
         pystripe_layout.addRow("Level", self.pystripe_level)
         pystripe_layout.addRow("Crossover", self.pystripe_crossover)
         pystripe_layout.addRow("Threshold", self.pystripe_threshold)
+        pystripe_layout.addRow("Dark offset", self.pystripe_dark)
+
+        processing_group = QGroupBox("Export PyStripe PNGs")
+        processing_layout = QGridLayout(processing_group)
+        processing_layout.addWidget(QLabel("Output root"), 0, 0)
+        processing_layout.addWidget(self.output_root, 0, 1)
+        processing_layout.addWidget(browse_output, 0, 2)
+        processing_layout.addWidget(QLabel("Scope"), 1, 0)
+        processing_layout.addWidget(self.pystripe_scope, 1, 1)
+        processing_layout.addWidget(process_pystripe, 1, 2)
+
+        illumination_group = QGroupBox("Illumination Correction")
+        illumination_layout = QFormLayout(illumination_group)
+        illumination_layout.addRow("Enable", self.enable_illumination)
+        illumination_layout.addRow("Tile columns", self.illumination_tile_cols)
+        illumination_layout.addRow("Tile rows", self.illumination_tile_rows)
+        illumination_layout.addRow("Left columns factor", self.illumination_left_factor)
+        illumination_layout.addRow("Right columns factor", self.illumination_right_factor)
+        illumination_layout.addRow("Edge blend width", self.illumination_blend_width)
 
         progress_layout = QHBoxLayout()
         progress_layout.addWidget(self.status_label)
         progress_layout.addWidget(self.progress_bar)
 
-        layout.addWidget(controls)
-        layout.addWidget(pystripe_group)
-        layout.addWidget(self.view, stretch=1)
-        layout.addWidget(QLabel("Selected Tile"))
-        layout.addWidget(self.selected_tile_info)
-        layout.addLayout(progress_layout)
-        layout.addWidget(QLabel("Log"))
-        layout.addWidget(self.log)
+        sidebar_content = QWidget()
+        sidebar_layout = QVBoxLayout(sidebar_content)
+        sidebar_layout.addWidget(controls)
+        sidebar_layout.addWidget(pystripe_group)
+        sidebar_layout.addWidget(illumination_group)
+        sidebar_layout.addWidget(processing_group)
+        sidebar_layout.addStretch()
+
+        sidebar = QScrollArea()
+        sidebar.setWidget(sidebar_content)
+        sidebar.setWidgetResizable(True)
+        sidebar.setMinimumWidth(340)
+        sidebar.setMaximumWidth(460)
+
+        viewer_panel = QWidget()
+        viewer_layout = QVBoxLayout(viewer_panel)
+        viewer_layout.addWidget(self.view, stretch=1)
+        viewer_layout.addWidget(QLabel("Selected Tile"))
+        viewer_layout.addWidget(self.selected_tile_info)
+        viewer_layout.addLayout(progress_layout)
+        viewer_layout.addWidget(QLabel("Log"))
+        viewer_layout.addWidget(self.log)
+
+        splitter.addWidget(sidebar)
+        splitter.addWidget(viewer_panel)
+        splitter.setSizes([380, 1200])
+        layout.addWidget(splitter)
         return root
 
     def choose_root(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Choose raw PNG dataset root")
         if path:
             self.root_path.setText(path)
+            if not self.output_root.text().strip():
+                raw_root = Path(path)
+                self.output_root.setText(str(raw_root.parent / f"{raw_root.name}_pystripe"))
             self.scan_channels()
+
+    def choose_output_root(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Choose PyStripe output root")
+        if path:
+            self.output_root.setText(path)
 
     def scan_channels(self) -> None:
         raw_root = Path(self.root_path.text()).expanduser()
@@ -609,6 +917,9 @@ class RawTileGridWindow(QMainWindow):
     def on_channels_scanned(self, channel_dirs: list[Path]) -> None:
         self.set_busy("Ready", False)
         self.channel_dirs = channel_dirs
+        self.current_grid = None
+        self.selected_tile = None
+        self.selected_tile_info.clear()
         self.channel_combo.clear()
         for channel_dir in channel_dirs:
             self.channel_combo.addItem(channel_dir.name, userData=channel_dir)
@@ -647,6 +958,8 @@ class RawTileGridWindow(QMainWindow):
         self.current_grid = grid
         self.mosaic_items = items
         self.tile_graphics = []
+        self.processed_mosaic_arrays = None
+        self.preview_pystripe_grid.setChecked(False)
         self.grid_rects = []
         self.selected_tile = None
         self.selection_rect = None
@@ -686,20 +999,54 @@ class RawTileGridWindow(QMainWindow):
         return "Original" if value == 0 else f"{value}px"
 
     def array_to_qimage(self, array: np.ndarray) -> QImage:
-        finite = np.asarray(array, dtype=np.float32)
-        low = float(self.display_min.value())
-        high = float(self.display_max.value())
-        if high <= low:
-            high = low + 1.0
-        scaled = ((finite - low) * 255.0 / (high - low)).clip(0, 255).astype(np.uint8)
-        height, width = scaled.shape
-        return QImage(scaled.data, width, height, width, QImage.Format_Grayscale8).copy()
+        return array_to_qimage(array, float(self.display_min.value()), float(self.display_max.value()))
 
     def update_live_contrast(self) -> None:
         if not self.tile_graphics:
             return
-        for pixmap_item, array in self.tile_graphics:
-            pixmap_item.setPixmap(QPixmap.fromImage(self.array_to_qimage(array)))
+        arrays = self.displayed_mosaic_arrays()
+        for (pixmap_item, _array), display_array in zip(self.tile_graphics, arrays):
+            pixmap_item.setPixmap(QPixmap.fromImage(self.array_to_qimage(display_array)))
+
+    def displayed_mosaic_arrays(self) -> list[np.ndarray]:
+        if self.preview_pystripe_grid.isChecked() and self.processed_mosaic_arrays is not None:
+            return self.processed_mosaic_arrays
+        return [array for _pixmap_item, array in self.tile_graphics]
+
+    def update_pystripe_grid_preview(self) -> None:
+        if not self.tile_graphics:
+            self.preview_pystripe_grid.setChecked(False)
+            return
+        if not self.preview_pystripe_grid.isChecked():
+            self.update_live_contrast()
+            self.log_message("Showing original middle-Z grid.")
+            return
+        if self.processed_mosaic_arrays is not None:
+            self.update_live_contrast()
+            self.log_message("Showing PyStripe preview on the middle-Z grid.")
+            return
+        if self.pystripe_preview_worker is not None and self.pystripe_preview_worker.isRunning():
+            return
+
+        items = [(pixmap_item.plane, array) for pixmap_item, array in self.tile_graphics]
+        self.set_busy("Building PyStripe grid preview...", True)
+        self.pystripe_preview_worker = PyStripeMosaicPreviewWorker(items, self.pystripe_params())
+        self.pystripe_preview_worker.progress.connect(self.on_pystripe_progress)
+        self.pystripe_preview_worker.finished_ok.connect(self.on_pystripe_preview_finished)
+        self.pystripe_preview_worker.failed.connect(self.on_pystripe_preview_failed)
+        self.pystripe_preview_worker.start()
+
+    def on_pystripe_preview_finished(self, processed: list[tuple[RawTilePlane, np.ndarray]]) -> None:
+        self.processed_mosaic_arrays = [array for _plane, array in processed]
+        self.set_busy("Ready", False)
+        self.update_live_contrast()
+        self.log_message("Showing PyStripe preview on the middle-Z grid.")
+
+    def on_pystripe_preview_failed(self, details: str) -> None:
+        self.preview_pystripe_grid.blockSignals(True)
+        self.preview_pystripe_grid.setChecked(False)
+        self.preview_pystripe_grid.blockSignals(False)
+        self.on_worker_failed(details)
 
     def update_grid_visibility(self) -> None:
         visible = self.show_grid.isChecked()
@@ -743,6 +1090,69 @@ class RawTileGridWindow(QMainWindow):
         self.diagnostics_windows.append(window)
         window.show()
 
+    def process_pystripe(self) -> None:
+        channel_dir: Path | None = self.channel_combo.currentData()
+        if channel_dir is None:
+            self.show_error("Scan and choose a channel first.")
+            return
+
+        output_root_text = self.output_root.text().strip()
+        if not output_root_text:
+            raw_root = Path(self.root_path.text()).expanduser()
+            output_root = raw_root.parent / f"{raw_root.name}_pystripe"
+            self.output_root.setText(str(output_root))
+        else:
+            output_root = Path(output_root_text).expanduser()
+
+        try:
+            if self.current_grid is not None and self.current_grid.channel_dir == channel_dir:
+                grid = self.current_grid
+            else:
+                grid = discover_channel_grid(channel_dir)
+            if self.pystripe_scope.currentIndex() == 0:
+                if self.selected_tile is None:
+                    self.show_error("Select a tile first, or change the scope to Current channel.")
+                    return
+                stacks = [
+                    stack
+                    for stack in grid.stacks
+                    if stack.stack_dir == self.selected_tile.plane.path.parent
+                ]
+                if not stacks:
+                    self.show_error("Could not match the selected tile to the current channel grid.")
+                    return
+            else:
+                stacks = list(grid.stacks)
+        except Exception:
+            self.on_worker_failed(traceback.format_exc())
+            return
+
+        self.set_busy("Running PyStripe...", True)
+        self.pystripe_worker = PyStripeProcessWorker(
+            stacks=stacks,
+            output_root=output_root,
+            pystripe_params=self.pystripe_params(),
+        )
+        self.pystripe_worker.progress.connect(self.on_pystripe_progress)
+        self.pystripe_worker.finished_ok.connect(self.on_pystripe_finished)
+        self.pystripe_worker.failed.connect(self.on_worker_failed)
+        self.pystripe_worker.start()
+
+    def on_pystripe_progress(self, current: int, total: int, message: str) -> None:
+        self.status_label.setText(f"{message} ({current}/{total})")
+        self.progress_bar.setRange(0, max(1, total))
+        self.progress_bar.setValue(current)
+
+    def on_pystripe_finished(self, results: dict[str, Any]) -> None:
+        self.set_busy("Ready", False)
+        self.log_message(
+            f"PyStripe processed {results['planes']} plane(s) from {results['stacks']} tile stack(s).\n"
+            f"Output root: {results['output_root']}\n"
+            f"First output: {results['first_output']}\n"
+            f"Last output: {results['last_output']}\n"
+            f"Parameters: {results['pystripe_params']}"
+        )
+
     def pystripe_params(self) -> dict[str, Any]:
         return {
             "wavelet": self.pystripe_wavelet.currentText(),
@@ -751,6 +1161,13 @@ class RawTileGridWindow(QMainWindow):
             "level": self.pystripe_level.value(),
             "crossover": self.pystripe_crossover.value(),
             "threshold": self.pystripe_threshold.value(),
+            "dark": self.pystripe_dark.value(),
+            "enable_illumination": self.enable_illumination.isChecked(),
+            "illumination_tile_cols": self.illumination_tile_cols.value(),
+            "illumination_tile_rows": self.illumination_tile_rows.value(),
+            "illumination_left_factor": self.illumination_left_factor.value(),
+            "illumination_right_factor": self.illumination_right_factor.value(),
+            "illumination_blend_width": self.illumination_blend_width.value(),
         }
 
     def fit_mosaic(self) -> None:
